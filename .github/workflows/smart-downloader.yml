@@ -1,4 +1,4 @@
-name: '📦 حرفه‌ای: دانلود و ذخیره در مخزن'
+name: '📦 دانلود و ذخیره در مخزن'
 
 on:
   workflow_dispatch:
@@ -7,17 +7,10 @@ on:
         description: '🔗 لینک مستقیم فایل‌ها (با کاما جدا کنید) مثال: url1,url2,url3'
         required: true
         type: string
-        default: 'LINK1,LINK2,LINK3'
       password:
         description: '🔐 رمز فایل فشرده (اختیاری)'
         required: false
         type: string
-        default: ''
-      split_size:
-        description: '📦 حجم هر تکه (پیش‌فرض: 95m)'
-        required: false
-        type: string
-        default: '95m'
 
 permissions:
   contents: write
@@ -32,83 +25,134 @@ jobs:
       - name: ⚙️ نصب ابزارها
         run: |
           sudo apt-get update
-          sudo apt-get install -y p7zip-full file
+          sudo apt-get install -y p7zip-full file aria2 curl
 
-      - name: 📥 پردازش و دانلود همه فایل‌ها
-        id: process
+      - name: 🔧 تنظیم بافر HTTP
         run: |
-          # تبدیل ورودی: جدا کردن با کاما و حذف فاصله‌های اضافی
-          echo "${{ github.event.inputs.file_urls }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed '/^$/d' > /tmp/urls.txt
-          
-          while IFS= read -r URL || [ -n "$URL" ]; do
-            [ -z "$URL" ] && continue
-            
-            echo "========================================="
-            echo "🔽 شروع دانلود: $URL"
-            
-            # استخراج نام فایل از لینک
-            FILENAME=$(basename "$URL" | sed 's/\?.*//' | sed 's/%20/ /g')
-            if [ -z "$FILENAME" ]; then
-              FILENAME="downloaded_file_$(date +%s)"
-            fi
-            
-            SAFE_FILENAME=$(echo "$FILENAME" | sed 's/[\\/:*?"<>|]/_/g')
-            echo "نام فایل: $SAFE_FILENAME"
-            
-            curl -L --fail --retry 3 --retry-delay 2 --progress-bar -o "$SAFE_FILENAME" "$URL"
-            if [ $? -ne 0 ]; then
-              echo "❌ خطا در دانلود: $URL → ادامه به لینک بعدی"
-              continue
-            fi
-            
-            echo "✅ دریافت شد: $SAFE_FILENAME"
-            
-            # تشخیص دسته و ساخت پوشه
-            RAW_NAME="$SAFE_FILENAME"
-            BASENAME_NOEXT="${RAW_NAME%.*}"
-            [ "$BASENAME_NOEXT" = "$RAW_NAME" ] && BASENAME_NOEXT="$RAW_NAME"
-            FOLDER_NAME=$(echo "$BASENAME_NOEXT" | sed 's/[\\/:*?"<>|]/_/g')
-            [ -z "$FOLDER_NAME" ] && FOLDER_NAME="downloaded_file"
-            
-            MIME=$(file -b --mime-type "$SAFE_FILENAME")
-            EXT="${RAW_NAME##*.}"
-            EXT=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
-            
-            if [[ "$MIME" == video/* ]] || [[ "$EXT" =~ ^(mp4|mkv|avi|mov|wmv|flv|webm)$ ]]; then
-              CAT="video"
-            elif [[ "$MIME" == audio/* ]] || [[ "$EXT" =~ ^(mp3|wav|ogg|flac|m4a)$ ]]; then
-              CAT="audio"
-            elif [[ "$MIME" == image/* ]] || [[ "$EXT" =~ ^(jpg|jpeg|png|gif|bmp|webp)$ ]]; then
-              CAT="image"
-            elif [[ "$MIME" == application/pdf ]] || [[ "$EXT" =~ ^(pdf|doc|docx|xls|xlsx|ppt|pptx|txt)$ ]]; then
-              CAT="document"
-            else
-              CAT="other"
-            fi
-            
-            FINAL_DIR="downloads/$CAT/$FOLDER_NAME"
-            mkdir -p "$FINAL_DIR"
-            
-            rm -f "$FINAL_DIR"/*.7z*
-            
-            if [ -z "${{ github.event.inputs.password }}" ]; then
-              7z a -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "$FINAL_DIR/archive.7z" "./$SAFE_FILENAME"
-            else
-              7z a -p"${{ github.event.inputs.password }}" -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "$FINAL_DIR/archive.7z" "./$SAFE_FILENAME"
-            fi
-            
-            echo "✅ ذخیره شد: $FOLDER_NAME ← $SAFE_FILENAME"
-            
-            rm -f "$SAFE_FILENAME"
-            
-          done < /tmp/urls.txt
-          
-          echo "🎉 همه لینک‌ها پردازش شدند."
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
 
-      - name: 📝 کامیت و پوش به مخزن
+      - name: 📥 پردازش و دانلود فایل‌ها
         run: |
+          # آماده‌سازی لیست لینک‌ها
+          echo "${{ github.event.inputs.file_urls }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > /tmp/urls.txt
+          TOTAL_URLS=$(wc -l < /tmp/urls.txt)
+          echo "🔹 تعداد کل لینک‌ها: $TOTAL_URLS"
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add downloads/
-          git commit -m "Add multiple files [$(date +'%Y-%m-%d %H:%M')]" || echo "Nothing to commit"
-          git push
+
+          COUNTER=0
+          while IFS= read -r URL; do
+            [ -z "$URL" ] && continue
+            COUNTER=$((COUNTER+1))
+            echo ""
+            echo "============================================================"
+            echo "🔽 [${COUNTER}/${TOTAL_URLS}] شروع پردازش: $URL"
+            echo "============================================================"
+
+            # ----- مرحله 1: استخراج نام واقعی فایل (چند روش) -----
+            echo "🔍 [1/4] شناسایی نام فایل..."
+            REAL_FILENAME=$(curl -sI "$URL" | grep -i 'Content-Disposition' | sed -n 's/.*filename="\([^"]*\)".*/\1/p')
+            if [ -z "$REAL_FILENAME" ]; then
+              REAL_FILENAME=$(echo "$URL" | grep -oP '(?<=filename=)[^&]+' | sed 's/%20/ /g' 2>/dev/null || true)
+            fi
+            if [ -z "$REAL_FILENAME" ]; then
+              REAL_FILENAME=$(basename "$URL" | sed 's/\?.*//' | sed 's/%20/ /g')
+            fi
+            if [ -z "$REAL_FILENAME" ]; then
+              REAL_FILENAME="file_$(date +%s)"
+            fi
+            SAFE_FILENAME=$(echo "$REAL_FILENAME" | sed 's/[\\/:*?"<>|]/_/g')
+            echo "   📛 نام پایه: $SAFE_FILENAME"
+
+            # ----- مرحله 2: دانلود با تلاش مجدد (تا 10 بار) -----
+            echo "⏳ [2/4] دانلود فایل (با قابلیت ادامه و تلاش مجدد)..."
+            MAX_RETRIES=10
+            RETRY=0
+            SUCCESS=false
+            while [ $RETRY -lt $MAX_RETRIES ] && [ "$SUCCESS" = false ]; do
+              if [ $RETRY -gt 0 ]; then
+                echo "   ⚠️ تلاش مجدد $RETRY/$MAX_RETRIES (بعد از ۱۰ ثانیه)..."
+                sleep 10
+              fi
+              aria2c --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                     --max-connection-per-server=4 --split=4 --min-split-size=1M \
+                     --continue=true --retry-wait=10 --max-tries=1 --timeout=60 \
+                     --console-log-level=error -o "$SAFE_FILENAME" "$URL" > /tmp/aria2.log 2>&1
+              if [ $? -eq 0 ]; then
+                SUCCESS=true
+                echo "   ✅ دانلود کامل شد."
+              else
+                RETRY=$((RETRY+1))
+              fi
+            done
+            if [ "$SUCCESS" = false ]; then
+              echo "❌ خطا: دانلود فایل $SAFE_FILENAME پس از $MAX_RETRIES تلاش ناموفق بود."
+              exit 1
+            fi
+
+            # ----- مرحله 3: تشخیص فرمت واقعی و اضافه کردن پسوند -----
+            echo "🔍 [3/4] تشخیص فرمت فایل و اصلاح پسوند..."
+            REAL_MIME=$(file -b --mime-type "$SAFE_FILENAME")
+            EXT=""
+            case "$REAL_MIME" in
+              video/mp4) EXT="mp4" ;; video/webm) EXT="webm" ;;
+              video/x-matroska) EXT="mkv" ;; audio/mpeg) EXT="mp3" ;;
+              audio/ogg) EXT="ogg" ;; image/jpeg) EXT="jpg" ;;
+              image/png) EXT="png" ;; application/pdf) EXT="pdf" ;;
+            esac
+            if [ -n "$EXT" ]; then
+              NEW_NAME="${SAFE_FILENAME%.*}.$EXT"
+              if [ "$NEW_NAME" != "$SAFE_FILENAME" ]; then
+                mv "$SAFE_FILENAME" "$NEW_NAME"
+                SAFE_FILENAME="$NEW_NAME"
+                echo "   ✅ پسوند اضافه شد: $SAFE_FILENAME"
+              else
+                echo "   ✅ پسوند درست است."
+              fi
+            else
+              echo "   ⚠️ فرمت ناشناخته، بدون تغییر باقی ماند."
+            fi
+
+            # ----- مرحله 4: دسته‌بندی و فشرده‌سازی به قطعات 90 مگابایتی -----
+            echo "📁 [4/4] دسته‌بندی و ایجاد آرشیو (قطعات 90 مگابایت)..."
+            BASENAME_NOEXT="${SAFE_FILENAME%.*}"
+            FOLDER_NAME=$(echo "$BASENAME_NOEXT" | sed 's/[\\/:*?"<>|]/_/g')
+            [ -z "$FOLDER_NAME" ] && FOLDER_NAME="downloaded_file"
+
+            MIME=$(file -b --mime-type "$SAFE_FILENAME")
+            EXT="${SAFE_FILENAME##*.}"
+            if [[ "$MIME" == video/* ]]; then CAT="video"
+            elif [[ "$MIME" == audio/* ]]; then CAT="audio"
+            elif [[ "$MIME" == image/* ]]; then CAT="image"
+            elif [[ "$MIME" == application/pdf ]]; then CAT="document"
+            else CAT="other"
+            fi
+
+            FINAL_DIR="downloads/$CAT/$FOLDER_NAME"
+            mkdir -p "$FINAL_DIR"
+            rm -f "$FINAL_DIR"/*.7z*
+
+            if [ -z "${{ github.event.inputs.password }}" ]; then
+              7z a -mhe=on -mx=3 -v90m "$FINAL_DIR/archive.7z" "./$SAFE_FILENAME" > /dev/null
+            else
+              7z a -p"${{ github.event.inputs.password }}" -mhe=on -mx=3 -v90m "$FINAL_DIR/archive.7z" "./$SAFE_FILENAME" > /dev/null
+            fi
+            rm -f "$SAFE_FILENAME"
+            echo "   ✅ آرشیو در $FINAL_DIR ساخته شد."
+
+            # ----- push تدریجی (هر فایل جداگانه) -----
+            echo "📤 ارسال به مخزن (push تدریجی)..."
+            git add "$FINAL_DIR/"
+            git commit -m "Add $FOLDER_NAME [$(date +'%H:%M:%S')]" || echo "   ⚠️ بدون تغییر جدید"
+            git push --force-with-lease origin HEAD:${GITHUB_REF#refs/heads/} 2>&1 | grep -E "(error|fatal|Done|Everything up-to-date)" || true
+            echo "✅ فایل $COUNTER از $TOTAL_URLS با موفقیت ذخیره و ارسال شد."
+
+          done < /tmp/urls.txt
+
+          echo ""
+          echo "============================================================"
+          echo "🎉 همه لینک‌ها با موفقیت پردازش شدند."
+          echo "============================================================"
